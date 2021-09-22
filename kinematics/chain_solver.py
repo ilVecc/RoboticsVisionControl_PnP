@@ -1,28 +1,17 @@
+import numpy as np
 import rospy
 import PyKDL as KDL
-import math as m
-import numpy as np
-from sensor_msgs.msg import JointState
-from tf.transformations import euler_matrix, quaternion_multiply
 from kdl_parser_py import urdf as kdl_parser
-from utils.quaternions import quaternion_divide
-from utils.filters import filter_joint_states
+from status import JointStateFilter
+from utils.quaternions import quaternion_convert, quaternion_convert_from, pose
 
-JOINT_EFFORT  = [150.0, 150.0, 150.0, 28.0, 28.0, 28.0]
-JOINT_POS_MIN = [-m.pi, -m.pi, -m.pi, -m.pi, -m.pi, -m.pi]  # * 2
-JOINT_POS_MAX = [ m.pi,  m.pi,  m.pi,  m.pi,  m.pi,  m.pi]  # * 2
-JOINT_VEL_MIN = [-m.pi, -m.pi, -m.pi, -m.pi, -m.pi, -m.pi]
-JOINT_VEL_MAX = [ m.pi,  m.pi,  m.pi,  m.pi,  m.pi,  m.pi]
+JOINT_EFFORT = [150.0, 150.0, 150.0, 28.0, 28.0, 28.0]
+JOINT_POS_MIN = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]  # * 2
+JOINT_POS_MAX = [ np.pi,  np.pi,  np.pi,  np.pi,  np.pi,  np.pi]  # * 2
+JOINT_VEL_MIN = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
+JOINT_VEL_MAX = [ np.pi,  np.pi,  np.pi,  np.pi,  np.pi,  np.pi]
 
-JOINT_NAMES = [
-    'robot_arm_shoulder_pan_joint',
-    'robot_arm_shoulder_lift_joint',
-    'robot_arm_elbow_joint',
-    'robot_arm_wrist_1_joint',
-    'robot_arm_wrist_2_joint',
-    'robot_arm_wrist_3_joint'
-]
-
+# http://wiki.ros.org/tf2_kdl
 class RobotArm(object):
 
     def __init__(self, robot_prefix, base_name, ee_name):
@@ -32,35 +21,35 @@ class RobotArm(object):
             err = "Failed to construct kdl tree"
             rospy.logerr(err)
             raise RuntimeError(err)
-        
+
+        base_name = base_name[1:] if base_name.startswith('/') else base_name
+        ee_name = ee_name[1:] if ee_name.startswith('/') else ee_name
         # root_seg = tree.getRootSegment()  # KDL.SegmentMap.const_iterator
         self.chain = tree.getChain(base_name, ee_name)
 
         self.n = self.chain.getNrOfJoints()
-        self.joint_names = [str(self.chain.getSegment(i).getJoint().getName()) for i in range(self.n)]
-        self.joint_names = JOINT_NAMES
+        self.joint_names = [str(self.chain.getSegment(i).getJoint().getName())
+                            for i in range(self.chain.getNrOfSegments()) 
+                            if self.chain.getSegment(i).getJoint().getType() != KDL.Joint.Fixed]
         self.joint_pos = KDL.JntArray(self.n)
         self.joint_vel = KDL.JntArray(self.n)
-        self.joint_acc = KDL.JntArray(self.n)
         self.joint_eff = KDL.JntArray(self.n)
-        
+
         self.fk_pos_solver = KDL.ChainFkSolverPos_recursive(self.chain)
-        self.fk_vel_solver = KDL.ChainFkSolverVel_recursive(self.chain)
+        # self.fk_vel_solver = KDL.ChainFkSolverVel_recursive(self.chain)
         self.ik_pos_solver = KDL.ChainIkSolverPos_LMA(self.chain)
-        self.ik_vel_solver = KDL.ChainIkSolverVel_pinv(self.chain)
+        # self.ik_vel_solver = KDL.ChainIkSolverVel_pinv(self.chain)
         self.jac_solver = KDL.ChainJntToJacSolver(self.chain)
         self.jac_dot_solver = KDL.ChainJntToJacDotSolver(self.chain)
 
         # current pose
-        self.js_sub = rospy.Subscriber('%s/joint_states' % (robot_prefix), JointState, self._js_cb, queue_size=1)
+        self.js_filter = JointStateFilter(robot_prefix, self.joint_names, self._js_cb)
 
     def _js_cb(self, data):
-        # TODO filter joints
-        data = sorted(filter_joint_states(data, JOINT_NAMES), key=lambda e: JOINT_NAMES.index(e[0]))
-        for i, (_, p, v, a, e) in enumerate(data):
+        data = zip(data.name, data.position, data.velocity, data.effort)
+        for i, (_, p, v, e) in enumerate(data):
             self.joint_pos[i] = p
             self.joint_vel[i] = v
-            self.joint_acc[i] = a
             self.joint_eff[i] = e
 
     @staticmethod
@@ -73,23 +62,23 @@ class RobotArm(object):
         for i in range(n):
             jnt_array[i] = array[i]
         return jnt_array
-    
+
     @staticmethod
     def _from_JntArray(jnt_array):
         return np.array([el for el in jnt_array])
 
     @staticmethod
-    def _to_Frame(array):
+    def _to_Frame(pose):
         return KDL.Frame(
-            KDL.Rotation.Quaternion(array[3], array[4], array[5], array[6]), 
-            KDL.Vector(array[0], array[1], array[2])
+            KDL.Rotation.Quaternion(*quaternion_convert(pose['o']).tolist()),
+            KDL.Vector(*pose['p'].tolist())
         )
 
     @staticmethod
     def _from_Frame(frame):
         pos = np.array(RobotArm._from_JntArray(frame.p))
-        ori = np.array(frame.M.GetQuaternion(*tuple()))
-        return np.append(pos, ori)
+        ori = quaternion_convert_from(list(frame.M.GetQuaternion(*tuple())))
+        return pose(pos, ori)
 
     @staticmethod
     def _from_Twist(twist):
@@ -112,7 +101,8 @@ class RobotArm(object):
         return self._from_Frame(target_frame) if not error else None
 
     def IK(self, xd, q_guess=None):
-        q_arr = self._to_JntArray(q_guess) if q_guess is not None else KDL.JntArray(self.n)
+        q_arr = self._to_JntArray(
+            q_guess) if q_guess is not None else KDL.JntArray(self.n)
         x_frame = self._to_Frame(xd)
         target_joints = KDL.JntArray(self.n)
         error = self.ik_pos_solver.CartToJnt(q_arr, x_frame, target_joints)
@@ -129,7 +119,7 @@ class RobotArm(object):
         jac_dot = KDL.Jacobian(self.n)
         self.jac_dot_solver.JntToJacDot(qD_arr, jac_dot)
         return self._from_Jacobian(jac_dot)
-    
+
     def JDqD(self, q, qD):
         qD_arr = KDL.JntArrayVel(self._to_JntArray(q), self._to_JntArray(qD))
         twist = KDL.Twist()
@@ -139,60 +129,48 @@ class RobotArm(object):
     def get_current_pose(self):
         return self.FK(self.joint_pos)
 
-    def get_joint_dynamics(self, x, xD, xDD, q_guess=None):
-        
+    def _get_joint_dynamics(self, x, xD, xDD, q_guess=None):
+
         # position
         q = self.IK(x, q_guess)
+        if q is None:
+            return None
         Jpinv = np.linalg.pinv(self.J(q))
 
         # velocity
-        v = np.zeros(7)
-        v[0:3] = xD[0:3]
-        v[3:7] = quaternion_divide(2*xD[3:7], x[3:7])
-        qD = np.matmul(Jpinv, v[0:6])
-        
+        v = pose(
+            xD['p'],
+            2*xD['o'] / x['o']
+        )
+        v_vec = np.concatenate([v['p'], v['o'][()].vec])
+        qD = np.dot(Jpinv, v_vec)
+
         # acceleration
-        vD = np.zeros(7)
-        vD[0:3] = xDD[0:3]
-        vD[3:7] = quaternion_divide(2*xDD[3:7] - quaternion_multiply(v[3:7], xD[3:7]), x[3:7])
-        qDD = np.matmul(Jpinv, vD[0:6] - self.JDqD(q, qD))
+        vD = pose(
+            xDD['p'],
+            (2*xDD['o'] - v['o'] * xD['o']) / x['o']
+        )
+        vD_vec = np.concatenate([vD['p'], vD['o'][()].vec])
+        qDD = np.dot(Jpinv, vD_vec - self.JDqD(q, qD))
 
         return q, qD, qDD
 
-    def batch_get_joint_dynamics(self, X, XD, XDD, q_guess=None):
+    def get_joint_dynamics(self, X, XD, XDD, q_guess=None):
         assert X.shape[0] == XD.shape[0] and XD.shape[0] == XDD.shape[0], "Sequences must be of same length"
         N = X.shape[0]
         Q = np.zeros(shape=[N + 1, self.n])
-        if q_guess is not None:
-            Q[0, :] = q_guess
         QD = np.zeros(shape=[N, self.n])
         QDD = np.zeros(shape=[N, self.n])
+        # set initial conditions
+        if q_guess is not None:
+            Q[0, :] = q_guess
         for i in range(N):
-            Q[i+1, :], QD[i, :], QDD[i, :] = self.get_joint_dynamics(X[i, :], XD[i, :], XDD[i, :], q_guess=Q[i, :])
+            res = self._get_joint_dynamics(X[i], XD[i], XDD[i], q_guess=Q[i, :])
+            if res is not None:
+                Q[i+1, :], QD[i, :], QDD[i, :] = res[0], res[1], res[2]
+            else:
+                if i > 0:
+                    Q[i+1, :], QD[i, :], QDD[i, :] = Q[i, :], QD[i-1, :], QDD[i-1, :]
+                else:
+                    raise RuntimeError("Unable to begin the inverse kinematics trajectory")
         return Q[1:, :], QD, QDD
-
-if __name__ == '__main__':
-
-    # example of use
-    import numpy as np
-    q = np.random.rand(6) * 2*m.pi - m.pi
-    qD = np.random.rand(6) * 2*m.pi - m.pi
-    # TODO change to quaternion
-    xd = [0.8, 0.2, 0.1, 0, 0, 0, -1]
-
-    ra = RobotArm("/robot", "robot_arm_base", "robot_arm_tool0")
-
-    pose = ra.FK(q)
-    print("result frame fk_p \n%s" % (pose))
-
-    target_joints = ra.IK(xd)
-    print("result joints ik_p \n%s" % (target_joints))
-
-    jacobian = ra.J(q)
-    print("result jacobian \n%s" % (jacobian))
-
-    jacobian_dot = ra.JD(q, qD)
-    print("result jacobian dot \n%s" % (jacobian_dot))
-
-    twist = ra.JDqD(q, qD)
-    print("result twist \n%s" % (twist))
