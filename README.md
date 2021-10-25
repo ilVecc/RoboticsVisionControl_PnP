@@ -1,3 +1,5 @@
+⚠️ Cari colleghi italiani: le star sono gratis 😉
+
 # Robotics, Vision & Control - UR5 PnP control
 "Robotic, Vision and Control" course final project, focused on the Pick&amp;Place task on a UR5 robot using a RealSense camera.
 
